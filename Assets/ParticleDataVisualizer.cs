@@ -8,7 +8,9 @@ public class ParticleDataVisualizer : MonoBehaviour
     public string DataFileName;
     public float Radius = 1;
     public int VisibleTimeSlice = 1;
+    public Material _StandardMat;
     int _actualVisibleSlice = -1;
+    int _maxTimeSlice = 0;
 
     public class Particle
     {
@@ -16,7 +18,7 @@ public class ParticleDataVisualizer : MonoBehaviour
         public Vector3 position;
     }
 
-    // One material per group
+    // One color per group
     Dictionary<int, Color> _colorMap = new Dictionary<int, Color>();
 
     // Each time slice is a time slice index and a list of particle positions for that time slice
@@ -29,7 +31,6 @@ public class ParticleDataVisualizer : MonoBehaviour
 
     // Store a list of time slices
     List<TimeSlice> _timeSlices = new List<TimeSlice>();
-    int visibleParticleLayer { get { return 0; } }
 
     // For each time slice we'll be showing bunch of particle groups
     // Put each visible group in the hierarchy of one of these objects
@@ -37,8 +38,12 @@ public class ParticleDataVisualizer : MonoBehaviour
     // The last particle group here will be used as an object pool
     Dictionary<int, GameObject> _particleGroups = new Dictionary<int, GameObject>();
     int _visibleObjectLayer { get { return 0; } }
-
-    Material standardMat;
+    void moveInToGroup(GameObject go, int groupIdx)
+    {
+        go.transform.parent = _particleGroups[groupIdx].transform;
+        go.gameObject.layer = _visibleObjectLayer;
+        go.GetComponent<Renderer>().enabled = true;
+    }
 
     GameObject _objectPool;
     int _objectPoolLayer { get { return 2; } }
@@ -66,16 +71,29 @@ public class ParticleDataVisualizer : MonoBehaviour
         _objectPool = new GameObject("Object Pool");
         _objectPool.transform.parent = transform;
 
-        standardMat = new Material(Shader.Find("Standard"));
-        standardMat.enableInstancing = true;
-        standardMat.name = "Particle Instance Material";
+        _StandardMat = new Material(Shader.Find("Standard"));
+        _StandardMat.enableInstancing = true;
+        _StandardMat.name = "Particle Instance Material";
 
-        StartCoroutine(readTimeSlices(Resources.Load(DataFileName) as TextAsset));
-        StartCoroutine(findParticleGroups());
+        var dataFile = Resources.Load(DataFileName);
+        if (dataFile == null)
+        {
+            Camera.main.backgroundColor = Color.red;
+            Application.Quit();
+        }
+        else
+        {
+            StartCoroutine(readTimeSlices(dataFile as TextAsset));
+            StartCoroutine(findParticleGroups());
+        }
     }
 
-    // When this isn't null the coroutine below picks it up and finds groups
+    // When this isn't empty the coroutine below picks it up and finds groups
     List<TimeSlice> _pendingGroupFind = new List<TimeSlice>();
+
+    Vector3 _centroidSum;
+    int _centroidSumCount = 1;
+    public Vector3 centroid { get { return _centroidSum / _centroidSumCount; } }
 
     IEnumerator findParticleGroups()
     {
@@ -184,10 +202,15 @@ public class ParticleDataVisualizer : MonoBehaviour
                     float posX = float.Parse(stringValues[1]);
                     float posY = float.Parse(stringValues[2]);
                     float posZ = float.Parse(stringValues[3]);
+                    var pos = new Vector3(posX, posY, posZ);
+
+                    _centroidSum += pos;
+                    _centroidSumCount++;
 
                     // Create a particle object and store it in the time slice
-                    Particle p = new Particle { position = new Vector3(posX, posY, posZ) };
+                    Particle p = new Particle { position = pos };
                     sliceBeingRead.particles.Add(p);
+                    _maxTimeSlice = System.Math.Max(_maxTimeSlice, timeSliceIndex);
                 }
             }
         }
@@ -201,19 +224,8 @@ public class ParticleDataVisualizer : MonoBehaviour
         yield break;
     }
 
-    void Update() 
+    IEnumerator changeVisibleSlice(int timeSliceIndex)
     {
-        if (Input.GetKeyDown(KeyCode.RightArrow) && VisibleTimeSlice < _timeSlices.Count - 1)
-            VisibleTimeSlice++;
-
-        else if (Input.GetKeyDown(KeyCode.LeftArrow) && VisibleTimeSlice > 1)
-            VisibleTimeSlice--;
-
-        // Don't do anything unless this changes and it's now a slice that we have
-        if (VisibleTimeSlice == _actualVisibleSlice)
-            return;
-
-        Debug.Log("Displaying slice " + VisibleTimeSlice);
         TimeSlice timeSlice = null;
         foreach (TimeSlice ts in _timeSlices)
         {
@@ -225,24 +237,27 @@ public class ParticleDataVisualizer : MonoBehaviour
         }
 
         if (timeSlice == null)
-            return;
+            yield break;
+
+        _actualVisibleSlice = VisibleTimeSlice;
+        Debug.Log("Displaying slice " + VisibleTimeSlice);
+        yield return true;
 
         // Move everything we've got stored in groups into the object pool
+        // and destroy the emptied particle groups
         foreach (KeyValuePair<int, GameObject> particleGroup in _particleGroups)
         {
-            foreach(Transform particle in particleGroup.Value.transform)
+            Transform particleGroupTransform = particleGroup.Value.transform;
+            int particlesInGroup = particleGroupTransform.childCount;
+            for (int i = 0; i < particlesInGroup; i++)
             {
-                moveInToObjectPool(particle.gameObject);
+                moveInToObjectPool(particleGroupTransform.GetChild(0).gameObject);
             }
+            Destroy(particleGroupTransform.gameObject);
         }
-
-        // Destroy these groups, they'll get recreated
-        foreach (KeyValuePair<int, GameObject> particleGroup in _particleGroups)
-            Destroy(particleGroup.Value);
         _particleGroups.Clear();
 
-        MaterialPropertyBlock props = new MaterialPropertyBlock();
-
+        // take particles for this time-slice from the pool and store them in a list
         int numParticles = timeSlice.particles.Count;
         List<GameObject> particleColliders = new List<GameObject>();
         for (int i = 0; i < numParticles; i++)
@@ -259,34 +274,61 @@ public class ParticleDataVisualizer : MonoBehaviour
                 particleColliders.Add(GameObject.CreatePrimitive(PrimitiveType.Sphere));
             }
         }
+        yield return true;
 
+        // Set the particle rendering and add particles to groups
+        MaterialPropertyBlock props = new MaterialPropertyBlock();
         for (int i = 0; i < numParticles; i++)
         {
-            GameObject pc = particleColliders[i];
-            // Ensure that a particle group object exists for this group number
+            // use the cached group index and make sure it has a color
             int groupIndex = timeSlice.particles[i].groupIndex;
             if (_colorMap.ContainsKey(groupIndex) == false)
             {
                 _colorMap[groupIndex] = Random.ColorHSV();
             }
 
+            // set up the particle renderer by updating the color block per group
+            GameObject pc = particleColliders[i];
             Renderer particleRenderer = pc.GetComponent<Renderer>();
-            particleRenderer.material = standardMat;
+            particleRenderer.material = _StandardMat;
             props.SetColor("_Color", _colorMap[groupIndex]);
             particleRenderer.SetPropertyBlock(props);
 
+            // create the particle group parent object
             if (_particleGroups.ContainsKey(groupIndex) == false)
             {
                 GameObject groupObject = new GameObject("Group " + groupIndex);
                 groupObject.transform.parent = transform;
                 _particleGroups[groupIndex] = groupObject;
             }
-            
-            pc.transform.parent = _particleGroups[groupIndex].transform;
-            pc.gameObject.layer = _visibleObjectLayer;
-            particleRenderer.enabled = true;
+
+            // store in group and make visible
+            moveInToGroup(pc, groupIndex);
+            pc.transform.position = timeSlice.particles[i].position;
         }
 
-        _actualVisibleSlice = VisibleTimeSlice;
+        // update visible time slice
+        _changeVisibleSliceCoroutine = null;
+
+        yield break;
+    }
+
+    Coroutine _changeVisibleSliceCoroutine;
+    void Update() 
+    {
+        if (Input.GetKeyDown(KeyCode.RightArrow) && VisibleTimeSlice < _maxTimeSlice)
+            VisibleTimeSlice++;
+
+        else if (Input.GetKeyDown(KeyCode.LeftArrow) && VisibleTimeSlice > 1)
+            VisibleTimeSlice--;
+
+        // Don't do anything unless this changes and it's now a slice that we have
+        if (VisibleTimeSlice == _actualVisibleSlice)
+            return;
+
+        if (_changeVisibleSliceCoroutine != null)
+            StopCoroutine(_changeVisibleSliceCoroutine);
+
+        _changeVisibleSliceCoroutine = StartCoroutine(changeVisibleSlice(VisibleTimeSlice));
     }
 }
