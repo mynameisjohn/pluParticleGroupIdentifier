@@ -2,7 +2,7 @@
 using System.Collections.Generic;
 using UnityEngine;
 
-public class ReadTextAsset : MonoBehaviour
+public class ParticleDataVisualizer : MonoBehaviour
 {
     // The text file asset we'll be reading
     public string DataFileName;
